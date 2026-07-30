@@ -43,6 +43,7 @@ module cdeps_dnwm_comp
   use dshr_dfield_mod  , only : dfield_type, dshr_dfield_add, dshr_dfield_copy
   use dshr_fldlist_mod , only : fldlist_type, dshr_fldlist_add, dshr_fldlist_realize
   use nuopc_shr_methods, only : shr_get_rpointer_name
+  use, intrinsic :: ieee_arithmetic, only : ieee_is_finite
 
   implicit none
   private ! except
@@ -489,6 +490,7 @@ contains
     integer :: n
     integer :: n_spval        ! special/fill values clamped to 0 this advance
     integer :: n_neg          ! negative discharge values clamped to 0 this advance
+    integer :: n_nan          ! non-finite (NaN/Inf) discharge values this advance -> fatal
     character(len=CL) :: rpfile
     character(*), parameter :: subName = "(dnwm_comp_run) "
     !-------------------------------------------------------------------------------
@@ -546,8 +548,18 @@ contains
        ! reach-pairing bugs as mysteriously dry rivers.
        n_spval = 0
        n_neg   = 0
+       n_nan   = 0
        do n = 1, size(river_volume_flux)
-          if (abs(river_volume_flux(n)) > 1.0e28_r8) then
+          ! A NaN passes BOTH tests below -- every comparison with NaN is false --
+          ! so without this guard it would reach SCHISM unclamped and hit a
+          ! compiler-dependent max(0,NaN). Non-finite discharge (NaN or +/-Inf) is
+          ! never physical: it signals a corrupt stream or bad interpolation, and
+          ! unlike a finite fill value there is no sensible substitute. Fail the run
+          ! rather than silently forward or zero it. (Finite NetCDF fill sentinels
+          ! stay finite and are still caught by the 1e28 clamp below.)
+          if (.not. ieee_is_finite(river_volume_flux(n))) then
+             n_nan = n_nan + 1
+          else if (abs(river_volume_flux(n)) > 1.0e28_r8) then
              river_volume_flux(n) = 0.0_r8
              n_spval = n_spval + 1
           else if (river_volume_flux(n) < 0.0_r8) then
@@ -555,6 +567,13 @@ contains
              n_neg = n_neg + 1
           end if
        enddo
+       if (n_nan > 0) then
+          write(logunit,'(a,i8,a)') trim(subname)//' ERROR: ', n_nan, &
+               ' non-finite (NaN/Inf) discharge value(s) in river_volume_flux'
+          call shr_log_error(trim(subname)//' non-finite (NaN/Inf) discharge in '// &
+               'river_volume_flux; refusing to forward corrupt NWM data to SCHISM', rc=rc)
+          return
+       end if
        if (n_spval > 0 .or. n_neg > 0) then
           write(logunit,'(a,i8,a,i8,a)') trim(subname)//' WARNING: clamped ', n_spval, &
                ' special/fill value(s) and ', n_neg, ' negative discharge value(s) to 0'
