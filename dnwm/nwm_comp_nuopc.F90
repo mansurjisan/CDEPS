@@ -9,11 +9,11 @@ module cdeps_dnwm_comp
   !
   ! Cloned from the DROF (data runoff) cap. Unlike DROF, which exports gridded
   ! runoff (Forr_rofl/Forr_rofi in kg m-2 s-1), DNWM exports a single field
-  ! `river_volume_flux` carrying VOLUMETRIC discharge in m3 s-1, per source
-  ! element, intended for one-way NWM -> SCHISM forcing. The reach->element
-  ! pairing is done offline; DNWM's stream supplies per-element discharge on the
-  ! SCHISM element mesh, and the connector to SCHISM is a redistribution (no
-  ! gridded area-flux regrid). Mirrors DROF's datamode='copyall' passthrough.
+  ! carrying volumetric discharge in m3 s-1 for one-way NWM -> SCHISM forcing
+  ! (the connector to SCHISM is a redistribution). The exported field name is
+  ! selectable via the 'export_fldname' dnwm_nml entry: 'river_volume_flux'
+  ! (default, per-element volume-source contract) or 'river_flux_segment'
+  ! (N-segment flux-boundary contract); datamode='copyall' passthrough either way.
   !----------------------------------------------------------------------------
   use ESMF             , only : ESMF_VM, ESMF_VMBroadcast, ESMF_GridCompGet
   use ESMF             , only : ESMF_Mesh, ESMF_GridComp, ESMF_Time, ESMF_TimeInterval
@@ -100,8 +100,9 @@ module cdeps_dnwm_comp
   character(*) , parameter     :: modName =  "(cdeps_dnwm_comp)"
 #endif
 
-  ! Exported field: volumetric river discharge [m3 s-1], per source element.
-  character(*) , parameter     :: fldname_river = 'river_volume_flux'
+  ! Name of the exported discharge field [m3 s-1], selectable via dnwm_nml (see the
+  ! header comment): 'river_volume_flux' (default) or 'river_flux_segment'.
+  character(CL)                :: export_fldname = 'river_volume_flux'
 
   ! linked lists
   type(fldList_type) , pointer :: fldsExport => null()
@@ -111,7 +112,8 @@ module cdeps_dnwm_comp
   real(r8), pointer            :: model_frac(:) => null()
   integer , pointer            :: model_mask(:) => null()
 
-  ! module pointer arrays
+  ! Pointer to the exported discharge array. Name is historical: it points at whichever
+  ! field export_fldname resolved to; the hygiene loop below operates on the array itself.
   real(r8), pointer            :: river_volume_flux(:) => null()
 
   character(*) , parameter     :: u_FILE_u = &
@@ -192,7 +194,7 @@ contains
 
     namelist / dnwm_nml / datamode, model_meshfile, model_maskfile, &
          restfilm, nx_global, ny_global, skip_restart_read, export_all, &
-         advance_to_next_time
+         advance_to_next_time, export_fldname
 
     rc = ESMF_SUCCESS
 
@@ -239,6 +241,7 @@ contains
        write(logunit,F02)' skip_restart_read = ',skip_restart_read
        write(logunit,F02)' export_all = ', export_all
        write(logunit,F02)' advance_to_next_time = ', advance_to_next_time
+       write(logunit,F00)' export_fldname = ',trim(export_fldname)
        bcasttmp = 0
        bcasttmp(1) = nx_global
        bcasttmp(2) = ny_global
@@ -259,6 +262,8 @@ contains
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
     call ESMF_VMBroadcast(vm, restfilm, CL, main_task, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    call ESMF_VMBroadcast(vm, export_fldname, CL, main_task, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
     call ESMF_VMBroadcast(vm, bcasttmp, 5, main_task, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -276,17 +281,18 @@ contains
        return
     end if
 
-    ! river_volume_flux is not a CF/standard NUOPC field; register it (m3 s-1
-    ! volumetric discharge) so it can be advertised, realized and connected.
-    isPresent = NUOPC_FieldDictionaryHasEntry(trim(fldname_river), rc=rc)
+    ! Neither export field name is a standard NUOPC field; register whichever
+    ! export_fldname resolved to (m3 s-1) so it can be advertised/realized/connected.
+    ! Guarded by isPresent since the consuming OCN cap may already have registered it.
+    isPresent = NUOPC_FieldDictionaryHasEntry(trim(export_fldname), rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
     if (.not. isPresent) then
-       call NUOPC_FieldDictionaryAddEntry(trim(fldname_river), "m3 s-1", rc=rc)
+       call NUOPC_FieldDictionaryAddEntry(trim(export_fldname), "m3 s-1", rc=rc)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     end if
 
     call dshr_fldList_add(fldsExport, trim(flds_scalar_name))
-    call dshr_fldlist_add(fldsExport, trim(fldname_river))
+    call dshr_fldlist_add(fldsExport, trim(export_fldname))
 
     fldlist => fldsExport ! the head of the linked list
     do while (associated(fldlist))
@@ -503,11 +509,22 @@ contains
 
     if (first_time) then
        ! Initialize dfields
-       call dshr_dfield_add(dfields, sdat, trim(fldname_river), trim(fldname_river), exportState, logunit, mainproc, rc=rc)
+       call dshr_dfield_add(dfields, sdat, trim(export_fldname), trim(export_fldname), exportState, logunit, mainproc, rc=rc)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
+       ! export_fldname is used as both the export-state and stream field name, so it
+       ! must match the model-side token of stream_data_variables in dnwm.streams. If it
+       ! doesn't, dshr_dfield_copy silently skips the field and the export stays 0.0 (a
+       ! permanently dry river with no error) -- so fail loudly here instead.
+       if (dfields%stream_index <= 0 .or. dfields%fldbun_index <= 0) then
+          call shr_log_error(trim(subname)//' export_fldname "'//trim(export_fldname)// &
+               '" is not supplied by any dnwm stream; set the model-side name in '// &
+               'stream_data_variables (dnwm.streams) to match export_fldname (dnwm_in)', rc=rc)
+          return
+       end if
+
        ! Initialize module ponters
-       call dshr_state_getfldptr(exportState, trim(fldname_river) , fldptr1=river_volume_flux , rc=rc)
+       call dshr_state_getfldptr(exportState, trim(export_fldname) , fldptr1=river_volume_flux , rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
 
        ! Read restart if needed
@@ -568,10 +585,10 @@ contains
           end if
        enddo
        if (n_nan > 0) then
-          write(logunit,'(a,i8,a)') trim(subname)//' ERROR: ', n_nan, &
-               ' non-finite (NaN/Inf) discharge value(s) in river_volume_flux'
+          write(logunit,'(a,i8,a,a)') trim(subname)//' ERROR: ', n_nan, &
+               ' non-finite (NaN/Inf) discharge value(s) in ', trim(export_fldname)
           call shr_log_error(trim(subname)//' non-finite (NaN/Inf) discharge in '// &
-               'river_volume_flux; refusing to forward corrupt NWM data to SCHISM', rc=rc)
+               trim(export_fldname)//'; refusing to forward corrupt NWM data to SCHISM', rc=rc)
           return
        end if
        if (n_spval > 0 .or. n_neg > 0) then
